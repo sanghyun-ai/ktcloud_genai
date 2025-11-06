@@ -30,7 +30,9 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 import pyupbit
 
@@ -44,7 +46,37 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
-DATABASE_FILE = os.getenv("UPBIT_DATABASE_FILE", "./indicators.db")
+
+def _resolve_database_file() -> str:
+    """환경 변수 정보를 기반으로 SQLite 파일 경로를 계산한다."""
+
+    db_url = os.getenv("DATABASE_URL")
+    if db_url:
+        parsed = urlparse(db_url)
+        if parsed.scheme == "sqlite":
+            if db_url.startswith("sqlite:////"):
+                raw_path = "/" + db_url.replace("sqlite:////", "", 1)
+            elif db_url.startswith("sqlite:///"):
+                raw_path = db_url.replace("sqlite:///", "", 1)
+            else:
+                raw_path = parsed.path
+
+            path = Path(raw_path)
+            resolved = path.expanduser().resolve()
+            logging.info("DATABASE_URL 기반 SQLite 경로 사용: %s", resolved)
+            return str(resolved)
+        logging.warning(
+            "DATABASE_URL=%s 는 sqlite 스킴이 아니므로 UPBIT_DATABASE_FILE로 대체합니다.",
+            db_url,
+        )
+
+    fallback = os.getenv("UPBIT_DATABASE_FILE", "./indicators.db")
+    resolved_fallback = Path(fallback).expanduser().resolve()
+    logging.info("UPBIT_DATABASE_FILE 기반 SQLite 경로 사용: %s", resolved_fallback)
+    return str(resolved_fallback)
+
+
+DATABASE_FILE = _resolve_database_file()
 TABLE_PREFIX = os.getenv("UPBIT_TABLE_PREFIX", "positions_")
 
 # 대상 티커(Upbit 마켓 코드)

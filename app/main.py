@@ -3,6 +3,7 @@
 from fastapi import Depends, FastAPI
 
 from .config import Settings, get_settings
+from .services.sqlite import get_sqlite_path
 
 
 def create_app() -> FastAPI:
@@ -16,6 +17,12 @@ def create_app() -> FastAPI:
         """헬스체크 및 현재 앱 이름 확인."""
 
         return {"status": "ok", "app": settings.app_name}
+
+    @app.get("/db/info", tags=["database"])
+    def database_info() -> dict[str, str]:
+        """현재 API가 사용하는 SQLite 파일 경로를 반환."""
+
+        return {"sqlite_path": str(get_sqlite_path())}
 
     return app
 
