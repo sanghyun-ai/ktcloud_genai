@@ -1,28 +1,24 @@
-"""Upbit ticker websocket collector that stores derived position metrics in SQLite.
+"""Upbit 티커 웹소켓 수집기를 통해 파생 포지션 지표를 SQLite에 저장합니다.
 
-This script extends the original indicator collector by switching to the
-Upbit websocket feed (`pyupbit.WebSocketManager`) and enriching the stored
-payload with trading-related metrics such as unrealised PnL, notional value,
-liquidation price and exit-plan data. The resulting snapshots are serialised
-as JSON and persisted per-ticker in SQLite tables named `positions_<ticker>`.
+이 스크립트는 기존 지표 수집기를 Upbit 웹소켓 피드(`pyupbit.WebSocketManager`)로 전환하여
+미실현 손익, 명목 가치, 청산가, 청산 계획 등 거래 관련 지표를 확장합니다. 생성된 스냅샷은
+JSON 형태로 직렬화되어 티커별 `positions_<ticker>` 테이블에 저장됩니다.
 
-Configuration notes
--------------------
-* Update `POSITIONS_CONFIG` (or provide an external JSON file) with your
-  current position details so calculations use accurate values. Each ticker
-  key may contain:
-    - quantity (base units)
-    - entry_price (quote currency)
-    - leverage
-    - side ("long" or "short")
-    - exit_plan (profit target, stop loss, invalidation text)
+구성 안내
+--------
+* 정확한 계산을 위해 `POSITIONS_CONFIG`(또는 외부 JSON 파일)을 최신 포지션 정보로 갱신하세요.
+  각 티커 키에는 다음과 같은 값을 포함할 수 있습니다.
+    - quantity: 보유 수량(기초 자산 수량)
+    - entry_price: 진입가(원화 기준)
+    - leverage: 레버리지 배율
+    - side: "long" 또는 "short"
+    - exit_plan: 목표가, 손절가, 무효화 조건
     - confidence, risk_usd, entry_oid, tp_oid, sl_oid, wait_for_fill
-    - liquidation_price (optional override)
-* Set `USD_KRW_RATE` (env var) if you prefer a custom USD/KRW conversion rate.
-  When possible the script will refresh the rate from Upbit's `USDT-KRW`
-  ticker; otherwise it falls back to the configured value.
+    - liquidation_price: 청산가 수동 입력(선택)
+* 사용자 정의 USD/KRW 환율이 필요하면 환경 변수 `USD_KRW_RATE`를 설정하세요. 가능하면
+  `USDT-KRW` 실시간 가격으로 환율을 갱신하고, 실패 시 설정값을 사용합니다.
 
-The script is designed to run continuously until interrupted.
+이 스크립트는 중단될 때까지 계속 실행되도록 설계되었습니다.
 """
 
 from __future__ import annotations
@@ -40,7 +36,7 @@ import pyupbit
 
 
 # ---------------------------------------------------------------------------
-# Logging & constants
+# 로깅 및 상수 설정
 # ---------------------------------------------------------------------------
 
 logging.basicConfig(
@@ -51,7 +47,7 @@ logging.basicConfig(
 DATABASE_FILE = os.getenv("UPBIT_DATABASE_FILE", "./indicators.db")
 TABLE_PREFIX = os.getenv("UPBIT_TABLE_PREFIX", "positions_")
 
-# Target tickers (Upbit market codes)
+# 대상 티커(Upbit 마켓 코드)
 TICKERS = [
     "KRW-BTC",
     "KRW-ETH",
@@ -62,7 +58,7 @@ TICKERS = [
 
 
 # ---------------------------------------------------------------------------
-# Position configuration handling
+# 포지션 구성 정보 로딩
 # ---------------------------------------------------------------------------
 
 POSITIONS_CONFIG_PATH = os.getenv("POSITIONS_CONFIG_PATH", "./positions_config.json")
@@ -112,7 +108,7 @@ POSITIONS_CONFIG = {
 
 
 # ---------------------------------------------------------------------------
-# Helper dataclass & utility functions
+# 보조 데이터클래스 및 유틸리티 함수
 # ---------------------------------------------------------------------------
 
 
@@ -189,7 +185,7 @@ def _calculate_risk_usd(
 
 @dataclass
 class ExchangeRateCache:
-    """Caches USD/KRW rate with optional Upbit refresh."""
+    """Upbit 데이터를 이용해 USD/KRW 환율을 주기적으로 갱신한다."""
 
     default_rate: float
     refresh_interval: float = float(os.getenv("USD_KRW_REFRESH_SECONDS", "600"))
@@ -217,7 +213,7 @@ class ExchangeRateCache:
 
 
 # ---------------------------------------------------------------------------
-# Database helpers
+# 데이터베이스 보조 함수
 # ---------------------------------------------------------------------------
 
 
@@ -253,7 +249,7 @@ def _save_snapshot(con: sqlite3.Connection, ticker: str, payload: Dict[str, Any]
 
 
 # ---------------------------------------------------------------------------
-# Snapshot construction
+# 스냅샷 생성 로직
 # ---------------------------------------------------------------------------
 
 
@@ -290,7 +286,7 @@ def _build_snapshot(
 
     if side == "short":
         unrealized_pnl_krw = (entry_price - trade_price) * quantity
-    else:  # default long
+    else:  # 기본적으로 롱 포지션으로 간주
         unrealized_pnl_krw = (trade_price - entry_price) * quantity
 
     unrealized_pnl_usd = (
@@ -352,7 +348,7 @@ def _build_snapshot(
 
 
 # ---------------------------------------------------------------------------
-# Main data collection loop
+# 메인 데이터 수집 루프
 # ---------------------------------------------------------------------------
 
 
@@ -386,7 +382,7 @@ def data_collection_loop(con: sqlite3.Connection) -> None:
                     continue
 
                 if last_timestamp_per_ticker.get(ticker) == trade_timestamp_ms:
-                    # Avoid duplicate saves for the same trade event
+                    # 동일한 체결 이벤트에 대한 중복 저장 방지
                     continue
 
                 last_timestamp_per_ticker[ticker] = trade_timestamp_ms
@@ -416,7 +412,7 @@ def data_collection_loop(con: sqlite3.Connection) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Entrypoint
+# 실행 진입점
 # ---------------------------------------------------------------------------
 
 
