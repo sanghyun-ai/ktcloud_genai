@@ -4,7 +4,7 @@ from fastapi import Depends, FastAPI
 
 from .config import Settings, get_settings
 from .database import settings as db_settings
-from .routers import indicators, positions
+from .routers import indicators, positions, trading
 
 
 def create_app() -> FastAPI:
@@ -21,6 +21,7 @@ def create_app() -> FastAPI:
 
     app.include_router(indicators.router, prefix=settings.api_v1_prefix)
     app.include_router(positions.router, prefix=settings.api_v1_prefix)
+    app.include_router(trading.router, prefix=settings.api_v1_prefix)
 
     @app.get("/db/info", tags=["database"])
     def database_info() -> dict[str, str]:
