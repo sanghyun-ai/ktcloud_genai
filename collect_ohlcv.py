@@ -217,12 +217,7 @@ def collect_ohlcv(
 
                     _upsert_ohlcv(session, symbol_id, interval, rows)
                     session.commit()
-                    logger.info(
-                        "OHLCV stored: %s (%s) rows=%d",
-                        ticker,
-                        interval,
-                        len(list(rows)),
-                    )
+                    logger.info("OHLCV stored: %s (%s) rows=%d", ticker, interval, len(rows))
                 except Exception as exc:  # noqa: BLE001
                     session.rollback()
                     logger.exception(

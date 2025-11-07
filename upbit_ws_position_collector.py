@@ -240,42 +240,6 @@ class ExchangeRateCache:
 
 
 # ---------------------------------------------------------------------------
-# 데이터베이스 보조 함수
-# ---------------------------------------------------------------------------
-
-
-def _ensure_table(con: sqlite3.Connection, table_name: str) -> None:
-    con.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {table_name} (
-            timestamp_key TEXT PRIMARY KEY,
-            recorded_at   TEXT,
-            json_data     TEXT
-        )
-        """
-    )
-
-
-def _save_snapshot(con: sqlite3.Connection, ticker: str, payload: Dict[str, Any]) -> None:
-    table_name = TABLE_PREFIX + ticker.replace("-", "_")
-    _ensure_table(con, table_name)
-
-    timestamp_key = str(payload["timestamp_key"])
-    recorded_at = payload["recorded_at"]
-    json_blob = json.dumps(payload, ensure_ascii=False)
-
-    con.execute(
-        f"""
-        INSERT OR REPLACE INTO {table_name} (timestamp_key, recorded_at, json_data)
-        VALUES (?, ?, ?)
-        """,
-        (timestamp_key, recorded_at, json_blob),
-    )
-    con.commit()
-    logging.info("Saved snapshot for %s at %s", ticker, recorded_at)
-
-
-# ---------------------------------------------------------------------------
 # 스냅샷 생성 로직
 # ---------------------------------------------------------------------------
 
