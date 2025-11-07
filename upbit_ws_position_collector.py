@@ -1,8 +1,9 @@
-"""Upbit 티커 웹소켓 수집기를 통해 파생 포지션 지표를 SQLite에 저장합니다.
+"""Upbit 티커 웹소켓 수집기를 통해 파생 포지션 지표를 데이터베이스(PostgreSQL 권장)에 저장합니다.
 
-이 스크립트는 기존 지표 수집기를 Upbit 웹소켓 피드(`pyupbit.WebSocketManager`)로 전환하여
-미실현 손익, 명목 가치, 청산가, 청산 계획 등 거래 관련 지표를 확장합니다. 생성된 스냅샷은
-JSON 형태로 직렬화되어 티커별 `positions_<ticker>` 테이블에 저장됩니다.
+이 스크립트는 Upbit 웹소켓 피드(`pyupbit.WebSocketManager`)로부터 실시간 체결 정보를 받아
+미실현 손익, 명목 가치, 청산가, 청산 계획 등 거래 관련 지표를 계산합니다. 계산된 결과는
+`position_snapshots`(JSONB)과 `positions`(정규화된 현재 상태) 테이블에 동시에 기록되어
+프론트엔드, LLM 의사결정, 백테스팅에 활용할 수 있습니다.
 
 구성 안내
 --------
@@ -26,15 +27,17 @@ from __future__ import annotations
 import json
 import logging
 import os
-import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Dict, Optional
-from urllib.parse import urlparse
 
 import pyupbit
+from sqlalchemy import JSON, MetaData, Table, delete, select
+from sqlalchemy import create_engine
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session, sessionmaker
 
 
 # ---------------------------------------------------------------------------
@@ -47,37 +50,20 @@ logging.basicConfig(
 )
 
 
-def _resolve_database_file() -> str:
-    """환경 변수 정보를 기반으로 SQLite 파일 경로를 계산한다."""
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./indicators.db")
 
-    db_url = os.getenv("DATABASE_URL")
-    if db_url:
-        parsed = urlparse(db_url)
-        if parsed.scheme == "sqlite":
-            if db_url.startswith("sqlite:////"):
-                raw_path = "/" + db_url.replace("sqlite:////", "", 1)
-            elif db_url.startswith("sqlite:///"):
-                raw_path = db_url.replace("sqlite:///", "", 1)
-            else:
-                raw_path = parsed.path
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+metadata = MetaData()
+IS_POSTGRES = engine.url.get_backend_name().startswith("postgres")
 
-            path = Path(raw_path)
-            resolved = path.expanduser().resolve()
-            logging.info("DATABASE_URL 기반 SQLite 경로 사용: %s", resolved)
-            return str(resolved)
-        logging.warning(
-            "DATABASE_URL=%s 는 sqlite 스킴이 아니므로 UPBIT_DATABASE_FILE로 대체합니다.",
-            db_url,
-        )
-
-    fallback = os.getenv("UPBIT_DATABASE_FILE", "./indicators.db")
-    resolved_fallback = Path(fallback).expanduser().resolve()
-    logging.info("UPBIT_DATABASE_FILE 기반 SQLite 경로 사용: %s", resolved_fallback)
-    return str(resolved_fallback)
-
-
-DATABASE_FILE = _resolve_database_file()
-TABLE_PREFIX = os.getenv("UPBIT_TABLE_PREFIX", "positions_")
+try:
+    symbols_table = Table("symbols", metadata, autoload_with=engine)
+    position_snapshots_table = Table("position_snapshots", metadata, autoload_with=engine)
+    positions_table = Table("positions", metadata, autoload_with=engine)
+except SQLAlchemyError as exc:  # pragma: no cover
+    logging.error("데이터베이스 스키마를 불러오지 못했습니다. 테이블이 생성되어 있는지 확인하세요: %s", exc)
+    raise
 
 # 대상 티커(Upbit 마켓 코드)
 TICKERS = [
@@ -167,6 +153,15 @@ def _safe_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"true", "1", "yes", "y"}
     return default
+
+
+def _safe_order_id(value: Any) -> Optional[int]:
+    if value in (None, "", -1, "-1"):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _ticker_to_symbol(ticker: str) -> str:
@@ -341,11 +336,18 @@ def _build_snapshot(
         fallback=position_cfg.get("risk_usd"),
     )
 
+    mode = str(position_cfg.get("mode", "live")).lower()
+    status = str(position_cfg.get("status", "open")).lower()
+    strategy_tag = position_cfg.get("strategy_tag")
+
     snapshot: Dict[str, Any] = {
         "timestamp_key": trade_timestamp_ms,
-        "recorded_at": trade_dt.isoformat(),
+        "recorded_at": trade_dt,
         "ticker": ticker,
         "symbol": symbol,
+        "mode": mode,
+        "status": status,
+        "strategy_tag": strategy_tag,
         "side": side,
         "quantity": _round_or_none(quantity, 6),
         "entry_price": _round_or_none(entry_price, 8),
@@ -380,11 +382,133 @@ def _build_snapshot(
 
 
 # ---------------------------------------------------------------------------
+# 데이터베이스 저장 로직
+# ---------------------------------------------------------------------------
+
+
+def _get_or_create_symbol(session: Session, ticker: str) -> int:
+    existing = session.execute(
+        select(symbols_table.c.id).where(symbols_table.c.market_code == ticker)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+
+    try:
+        quote, base = ticker.split("-")
+    except ValueError:
+        quote, base = "KRW", ticker
+
+    insert_stmt = (
+        symbols_table.insert()
+        .values(
+            market_code=ticker,
+            base_asset=base,
+            quote_asset=quote,
+            display_name=base,
+            is_active=True,
+        )
+        .returning(symbols_table.c.id)
+    )
+    symbol_id = session.execute(insert_stmt).scalar_one()
+    session.flush()
+    return symbol_id
+
+
+def _persist_snapshot(snapshot: Dict[str, Any]) -> None:
+    ticker = snapshot["ticker"]
+    mode = snapshot.get("mode", "live")
+    status = snapshot.get("status", "open")
+    exit_plan = snapshot.get("exit_plan", {})
+    entry_oid = snapshot.get("entry_oid")
+    tp_oid = snapshot.get("tp_oid")
+    sl_oid = snapshot.get("sl_oid")
+    wait_for_fill = _safe_bool(snapshot.get("wait_for_fill", False))
+
+    recorded_at_value = snapshot.get("recorded_at")
+    if isinstance(recorded_at_value, str):
+        recorded_at = datetime.fromisoformat(recorded_at_value)
+    else:
+        recorded_at = recorded_at_value
+
+    payload = snapshot.copy()
+    payload["recorded_at"] = recorded_at.isoformat()
+
+    with SessionLocal() as session:
+        try:
+            symbol_id = _get_or_create_symbol(session, ticker)
+
+            if IS_POSTGRES:
+                snapshot_stmt = pg_insert(position_snapshots_table).values(
+                    symbol_id=symbol_id,
+                    recorded_at=recorded_at,
+                    payload=payload,
+                    source="collector",
+                ).on_conflict_do_nothing(
+                    index_elements=["symbol_id", "recorded_at", "source"]
+                )
+            else:
+                snapshot_stmt = position_snapshots_table.insert().values(
+                    symbol_id=symbol_id,
+                    recorded_at=recorded_at,
+                    payload=payload,
+                    source="collector",
+                )
+            session.execute(snapshot_stmt)
+
+            session.execute(
+                delete(positions_table).where(
+                    positions_table.c.symbol_id == symbol_id,
+                    positions_table.c.mode == mode,
+                    positions_table.c.status == "open",
+                )
+            )
+
+            entry_order_id = _safe_order_id(entry_oid)
+
+            session.execute(
+                positions_table.insert().values(
+                    user_id=None,
+                    symbol_id=symbol_id,
+                    mode=mode,
+                    strategy_tag=snapshot.get("strategy_tag"),
+                    status=status,
+                    side=snapshot["side"],
+                    quantity=snapshot["quantity"],
+                    entry_price=snapshot["entry_price"],
+                    leverage=snapshot["leverage"],
+                    liquidation_price=snapshot["liquidation_price"],
+                    stop_loss=exit_plan.get("stop_loss"),
+                    take_profit=exit_plan.get("profit_target"),
+                    confidence=snapshot.get("confidence"),
+                    risk_usd=snapshot.get("risk_usd"),
+                    notional_usd=snapshot.get("notional_usd"),
+                    entry_timestamp=recorded_at,
+                    exit_timestamp=None,
+                    pnl_usd=snapshot.get("unrealized_pnl"),
+                    current_price=snapshot.get("current_price"),
+                    exit_plan_invalidation=exit_plan.get("invalidation_condition"),
+                    tp_order_id=_safe_order_id(tp_oid),
+                    sl_order_id=_safe_order_id(sl_oid),
+                    wait_for_fill=wait_for_fill,
+                    extra={
+                        "entry_oid": entry_order_id,
+                        "entry_oid_raw": entry_oid,
+                    },
+                )
+            )
+            session.commit()
+            logging.info("Saved snapshot for %s at %s", ticker, recorded_at.isoformat())
+        except SQLAlchemyError as exc:
+            session.rollback()
+            logging.exception("DB 저장 중 오류 발생 (%s): %s", ticker, exc)
+
+
+# ---------------------------------------------------------------------------
 # 메인 데이터 수집 루프
 # ---------------------------------------------------------------------------
 
 
-def data_collection_loop(con: sqlite3.Connection) -> None:
+def data_collection_loop() -> None:
     rate_cache = ExchangeRateCache(default_rate=float(os.getenv("USD_KRW_RATE", "1350.0")))
 
     while True:
@@ -430,7 +554,7 @@ def data_collection_loop(con: sqlite3.Connection) -> None:
                 if snapshot is None:
                     continue
 
-                _save_snapshot(con, ticker, snapshot)
+                _persist_snapshot(snapshot)
 
         except KeyboardInterrupt:
             logging.info("KeyboardInterrupt received. Shutting down loop...")
@@ -449,18 +573,11 @@ def data_collection_loop(con: sqlite3.Connection) -> None:
 
 
 def main() -> None:
+    logging.info("Starting data collection loop with database URL: %s", DATABASE_URL)
     try:
-        con = sqlite3.connect(DATABASE_FILE, check_same_thread=False)
-        logging.info("SQLite database connected at %s", DATABASE_FILE)
-    except sqlite3.Error as exc:  # noqa: BLE001
-        logging.error("Failed to connect to SQLite database: %s", exc)
-        raise SystemExit(1) from exc
-
-    try:
-        data_collection_loop(con)
+        data_collection_loop()
     finally:
-        con.close()
-        logging.info("DB connection closed. Program terminated.")
+        logging.info("Program terminated.")
 
 
 if __name__ == "__main__":
