@@ -1,73 +1,90 @@
-"""기술 지표 데이터 조회 라우터."""
+"""기술 지표 데이터 조회 라우터 (PostgreSQL)."""
 
 from __future__ import annotations
 
-import json
-import sqlite3
-from typing import Any
+from typing import Dict, List
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import MetaData, Table, select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
-from ..services.sqlite import get_sqlite_connection
+from app.database import engine, get_db
 
 
 router = APIRouter(prefix="/indicators", tags=["indicators"])
 
+metadata = MetaData()
 
-def _table_name_for_ticker(ticker: str) -> str:
-    return f"indicators_{ticker.replace('-', '_')}"
+try:
+    symbols_table = Table("symbols", metadata, autoload_with=engine)
+    indicator_snapshots_table = Table("indicator_snapshots", metadata, autoload_with=engine)
+except SQLAlchemyError as exc:  # pragma: no cover
+    raise RuntimeError(f"데이터베이스 스키마 로드 실패: {exc}") from exc
+
+
+def _resolve_symbol_id(db: Session, ticker: str) -> int:
+    ticker = ticker.upper()
+    query = select(symbols_table.c.id).where(symbols_table.c.market_code == ticker)
+    symbol_id = db.execute(query).scalar_one_or_none()
+    if symbol_id is None:
+        raise HTTPException(status_code=404, detail=f"'{ticker}' 심볼이 존재하지 않습니다.")
+    return symbol_id
+
+
+def _serialize_indicator_row(row: Dict) -> Dict:
+    indicators = row.get("indicators") or {}
+    indicators["timestamp"] = row.get("recorded_at")
+    indicators["interval"] = row.get("interval")
+    return indicators
 
 
 @router.get("/{ticker}/latest")
-def get_latest_indicator(ticker: str) -> dict[str, Any]:
+def get_latest_indicator(
+    ticker: str,
+    db: Session = Depends(get_db),
+) -> Dict:
     """지정한 티커의 최신 기술 지표 데이터를 반환."""
 
-    table_name = _table_name_for_ticker(ticker)
-    query = f"SELECT timestamp, json_data FROM {table_name} ORDER BY timestamp DESC LIMIT 1"
-
-    try:
-        with get_sqlite_connection(row_factory=True) as conn:
-            cursor = conn.execute(query)
-            row = cursor.fetchone()
-    except sqlite3.OperationalError as exc:
-        raise HTTPException(status_code=404, detail=f"테이블 '{table_name}' 조회에 실패했습니다: {exc}") from exc
-
+    symbol_id = _resolve_symbol_id(db, ticker)
+    stmt = (
+        select(
+            indicator_snapshots_table.c.interval,
+            indicator_snapshots_table.c.recorded_at,
+            indicator_snapshots_table.c.indicators,
+        )
+        .where(indicator_snapshots_table.c.symbol_id == symbol_id)
+        .order_by(indicator_snapshots_table.c.recorded_at.desc())
+        .limit(1)
+    )
+    row = db.execute(stmt).mappings().first()
     if row is None:
         raise HTTPException(status_code=404, detail=f"'{ticker}' 기술 지표 데이터가 존재하지 않습니다.")
 
-    try:
-        payload = json.loads(row["json_data"])  # type: ignore[index]
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise HTTPException(status_code=500, detail="DB에 저장된 JSON을 파싱할 수 없습니다.") from exc
-
-    payload["timestamp"] = row["timestamp"]  # type: ignore[index]
-    return payload
+    return _serialize_indicator_row(dict(row))
 
 
 @router.get("/{ticker}")
-def get_recent_indicators(ticker: str, limit: int = 200) -> list[dict[str, Any]]:
+def get_recent_indicators(
+    ticker: str,
+    limit: int = 200,
+    db: Session = Depends(get_db),
+) -> List[Dict]:
     """최신 순으로 여러 기술 지표 스냅샷을 반환."""
 
     if limit <= 0 or limit > 1000:
         raise HTTPException(status_code=400, detail="limit 값은 1~1000 사이여야 합니다.")
 
-    table_name = _table_name_for_ticker(ticker)
-    query = f"SELECT timestamp, json_data FROM {table_name} ORDER BY timestamp DESC LIMIT ?"
-
-    try:
-        with get_sqlite_connection(row_factory=True) as conn:
-            cursor = conn.execute(query, (limit,))
-            rows = cursor.fetchall()
-    except sqlite3.OperationalError as exc:
-        raise HTTPException(status_code=404, detail=f"테이블 '{table_name}' 조회에 실패했습니다: {exc}") from exc
-
-    results: list[dict[str, Any]] = []
-    for row in rows:
-        try:
-            payload = json.loads(row["json_data"])  # type: ignore[index]
-        except (TypeError, json.JSONDecodeError):
-            continue
-        payload["timestamp"] = row["timestamp"]  # type: ignore[index]
-        results.append(payload)
-
-    return results
+    symbol_id = _resolve_symbol_id(db, ticker)
+    stmt = (
+        select(
+            indicator_snapshots_table.c.interval,
+            indicator_snapshots_table.c.recorded_at,
+            indicator_snapshots_table.c.indicators,
+        )
+        .where(indicator_snapshots_table.c.symbol_id == symbol_id)
+        .order_by(indicator_snapshots_table.c.recorded_at.desc())
+        .limit(limit)
+    )
+    rows = db.execute(stmt).mappings().all()
+    return [_serialize_indicator_row(dict(row)) for row in rows]
