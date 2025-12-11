@@ -32,11 +32,12 @@ def preprocess_reason(text: str) -> str:
     reason 컬럼 전처리 함수
     
     원본 텍스트를 최대한 유지하면서 다음만 수행:
-    1. 줄 끝 공백 제거
-    2. 리스트 마커 뒤 공백 정규화 (단일 공백)
-    3. 숫자 섹션 헤더 뒤 공백 정규화 (단일 공백)
-    4. 연속된 빈 줄 정리 (최대 2개)
-    5. 전체 문서 앞뒤 공백 제거
+    1. "양형의 이유" 텍스트 제거
+    2. 줄 끝 공백 제거
+    3. 리스트 마커 뒤 공백 정규화 (단일 공백)
+    4. 숫자 섹션 헤더 뒤 공백 정규화 (단일 공백)
+    5. 연속된 빈 줄 정리 (최대 2개)
+    6. 전체 문서 앞뒤 공백 제거
     
     Args:
         text: 원본 reason 텍스트
@@ -46,6 +47,9 @@ def preprocess_reason(text: str) -> str:
     """
     if not text or not isinstance(text, str):
         return text
+    
+    # 0. "양형의 이유" 텍스트 제거 (맨 앞에 있는 경우)
+    text = re.sub(r'^\s*양형의\s*이유\s*\n', '', text, flags=re.MULTILINE)
     
     # 1. 줄 단위로 분리
     lines = text.split('\n')
@@ -100,7 +104,8 @@ class ReasonPatternType(Enum):
 
 def detect_pattern_type(text: str) -> ReasonPatternType:
     """패턴 타입 감지"""
-    if re.search(r'양형의\s*이유', text) and re.search(r'^\s*생략\s*$', text, re.MULTILINE):
+    # "생략"만 있는 경우 (양형의 이유는 이미 제거됨)
+    if re.search(r'^\s*생략\s*$', text, re.MULTILINE) and len(text.strip()) < 50:
         return ReasonPatternType.OMITTED
     
     has_statutory = bool(re.search(r'법률상\s+처단형의\s+범위', text))
